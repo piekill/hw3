@@ -1,0 +1,44 @@
+			 Syscall-Inherit Design Document
+				CSE 506 HW3
+		    Feifei Ji, Yuanting Luo, Junxing Yang
+Introdution
+-----------
+A system call provides an interface for user level program to request a service from an operating system's kernel. There are many predefined system calls, yet some processes would request system calls with customized features which are not supported by kernel, such as encryption before writing to a file. Therefore BSD allows users to define modules that can override or add a new system call to kernel by inheriting the syscall table per process.
+
+Unfortunately, this approach is not suppoted by Linux. The current design of Linux kernel does not expose syscall table to user level process, even loadable module could add or override it. In Linux system call is called in following process. 
+
+      USER 				   KERNEL
+call to printf()
+	|
+	V	     signal int $0x80
+printf() in C lib	   -->		system_call()
+					     |
+					     V
+					call *sys_call_table[num]
+					     |		
+		      return to USER	     V
+      return	           <--		  return
+
+The purpose of this project is to provide a framework that users can override the default system call table for a process. We can see from the graph that every time a process makes a syscall, it will cause a software interrupt 0x80, and served by an ISR system_call() that will lead to the entry point of the syscall. In order to let the process to call customized syscall, we must find a way to intercept syscalls some how. 
+
+The approach we plan to take is to intercept syscalls in the interrupt service routing. Instead of calling the default syscall table directly, the interrupt handler checks if the current process requested to use the its own syscall table. If a syscall table is loaded by that process, the interrupt handler will find the address of new syscall and call that function.
+
+Implementation
+--------------
+We provide a kernel helper module to maintain system call vectors that can be used by a process. A system call vector is similar with the default sys_call_table, which is an array of addresses of system call functions. A module can add or modify a system call vector by calling helper functions in the helper module and providing its own syscall function address.
+
+The helper module also provides a new fork() system call(svfork(),which stands for syscall_vector_fork), which allows a user level program to specify the syscall vector a new process will use when using fork to create the process. The identifier of the syscall vector is stored in task_struct. The task_struct will also have a flag to show whether the process will use the default sys_call_table or a syscall vector maintained by the helper module. svfork() will set up the identifier and the flag in task_struct and then call the old fork(). We should also fill these two fields in task_struct in default syscall fork() and clone() because we want the child process to inherit the syscall vector from its parent.
+
+We will change the system call handler so that whenever a user level program makes a system call, the system call handler will first check if the flag in the current task_struct is set. If it is set, then the handler will find the address of the new syscall function, which is provided by another module that registers its own function in that syscall vector, through the identifier of the syscall vector in task_struct and execute the function. If not, the handler will use the default sys_call_table.
+
+A syscall vector will also have a reference count protected by a spin lock. The refcount increases by 1 if a new process(by fork/clone) uses it, and decreases by 1 if the process exits. The helper module cannot free a syscall vector if its refcount is greater than 0. Other modules could not modify a syscall vector when its reference count is greater than 0. This policy is adopted to prevent possible inconsistency when a process is using the syscall vector.
+
+Test
+----
+To test our system, we use a module to register some system calls which are implemented by adding some printk statements at the beginning of the corresponding default syscall code by calling the helper functions in the helper module. 
+
+First, we run some user level test code using the default syscall vector and the newly registered syscall vector and compare the two results to ensure the registerd syscall vector works properly. 
+
+Second, we will test our new fork/clone functions and task_struct to see that subprocesses have the same syscall vector as their parents. 
+
+Third, we run LTP to validate the reliability, robustness, and stability of our system and some performance analysis tools to evaluate the overhead of our framework over vanilla kernel.
